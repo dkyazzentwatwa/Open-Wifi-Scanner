@@ -29,17 +29,8 @@ void displayWifiCount(const std::vector<WiFiNetwork>& list);
 
 void wifiInit();
 std::vector<WiFiNetwork> getWifiNetworks();
-std::vector<WiFiNetwork> getOpenWifiNetworks(std::vector<WiFiNetwork>& networks);
-std::vector<WiFiNetwork> getClosedWifiNetworks(const std::vector<WiFiNetwork>& networks);
-std::vector<WiFiNetwork> getVulnerableWifiNetworks(std::vector<WiFiNetwork>& networks);
-std::vector<WiFiNetwork> getValidatedOpenWifiNetworks(std::vector<WiFiNetwork>& networks);
-bool testOpenWifiConnection(const WiFiNetwork& network);
+void processWifiNetworks(std::vector<WiFiNetwork>& networks);
 String encryptionTypeToString(wifi_auth_mode_t encryption);
-std::vector<WiFiNetwork> mergeAndOrderWifiNetworks(
-    std::vector<WiFiNetwork>& closedNetworks,
-    std::vector<WiFiNetwork>& openNetworks,
-    std::vector<WiFiNetwork>& webAccessNetworks,
-    std::vector<WiFiNetwork>& vulnerableNetworks);
 
 //-------------------------------------------------------------
 // Display helpers
@@ -162,69 +153,16 @@ std::vector<WiFiNetwork> getWifiNetworks() {
   return networks;
 }
 
-std::vector<WiFiNetwork> getOpenWifiNetworks(std::vector<WiFiNetwork>& networks) {
-  std::vector<WiFiNetwork> openNetworks;
+void processWifiNetworks(std::vector<WiFiNetwork>& networks) {
   for (auto& network : networks) {
     if (network.encryption == WIFI_AUTH_OPEN) {
       network.open = true;
-      openNetworks.push_back(network);
-    }
-  }
-  return openNetworks;
-}
-
-std::vector<WiFiNetwork> getClosedWifiNetworks(const std::vector<WiFiNetwork>& networks) {
-  std::vector<WiFiNetwork> closedNetworks;
-  for (const auto& network : networks) {
-    if (network.encryption != WIFI_AUTH_OPEN) {
-      closedNetworks.push_back(network);
-    }
-  }
-  return closedNetworks;
-}
-
-std::vector<WiFiNetwork> getVulnerableWifiNetworks(std::vector<WiFiNetwork>& networks) {
-  std::vector<WiFiNetwork> vulnerableNetworks;
-  for (auto& network : networks) {
-    if (network.encryption == WIFI_AUTH_WEP ||
-        network.encryption == WIFI_AUTH_WPA_PSK) {
+    } else if (network.encryption == WIFI_AUTH_WEP) {
       network.vulnerable = true;
-      vulnerableNetworks.push_back(network);
     }
   }
-  return vulnerableNetworks;
 }
 
-std::vector<WiFiNetwork> getValidatedOpenWifiNetworks(std::vector<WiFiNetwork>& networks) {
-  std::vector<WiFiNetwork> validatedNetworks;
-  for (auto& network : networks) {
-    if (network.encryption == WIFI_AUTH_OPEN) {
-      if (testOpenWifiConnection(network)) {
-        network.webAccess = true;
-        validatedNetworks.push_back(network);
-      }
-    }
-  }
-  return validatedNetworks;
-}
-
-bool testOpenWifiConnection(const WiFiNetwork& network) {
-  WiFi.begin(network.ssid.c_str());
-  int maxRetries = 3;
-  while (WiFi.status() != WL_CONNECTED && maxRetries > 0) {
-    delay(300);
-    maxRetries--;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    return false;
-  }
-  HTTPClient http;
-  http.begin("http://example.com");
-  int httpCode = http.GET();
-  http.end();
-  WiFi.disconnect();
-  return httpCode > 0;
-}
 
 String encryptionTypeToString(wifi_auth_mode_t encryption) {
   switch (encryption) {
@@ -251,41 +189,15 @@ String encryptionTypeToString(wifi_auth_mode_t encryption) {
   }
 }
 
-std::vector<WiFiNetwork> mergeAndOrderWifiNetworks(
-    std::vector<WiFiNetwork>& closedNetworks,
-    std::vector<WiFiNetwork>& openNetworks,
-    std::vector<WiFiNetwork>& webAccessNetworks,
-    std::vector<WiFiNetwork>& vulnerableNetworks) {
-  std::vector<WiFiNetwork> mergedNetworks;
-  mergedNetworks.insert(mergedNetworks.end(), webAccessNetworks.begin(), webAccessNetworks.end());
-
-  openNetworks.erase(std::remove_if(openNetworks.begin(), openNetworks.end(),
-                                    [&webAccessNetworks](const WiFiNetwork& network) {
-                                      return std::any_of(webAccessNetworks.begin(), webAccessNetworks.end(),
-                                                         [&network](const WiFiNetwork& webNetwork) {
-                                                           return webNetwork.ssid == network.ssid;
-                                                         });
-                                    }),
-                     openNetworks.end());
-  mergedNetworks.insert(mergedNetworks.end(), openNetworks.begin(), openNetworks.end());
-
-  mergedNetworks.insert(mergedNetworks.end(), vulnerableNetworks.begin(), vulnerableNetworks.end());
-
-  closedNetworks.erase(std::remove_if(closedNetworks.begin(), closedNetworks.end(),
-                                      [&vulnerableNetworks](const WiFiNetwork& network) {
-                                        return std::any_of(vulnerableNetworks.begin(), vulnerableNetworks.end(),
-                                                           [&network](const WiFiNetwork& vulnNetwork) {
-                                                             return vulnNetwork.ssid == network.ssid;
-                                                           });
-                                      }),
-                        closedNetworks.end());
-  mergedNetworks.insert(mergedNetworks.end(), closedNetworks.begin(), closedNetworks.end());
-  return mergedNetworks;
-}
-
 //-------------------------------------------------------------
 // Main application
 //-------------------------------------------------------------
+
+std::vector<WiFiNetwork> networks;
+int webTestIndex = 0;
+unsigned long webTestStartTime = 0;
+bool testingConnection = false;
+const unsigned long connectionTimeout = 5000; // 5 seconds
 
 bool running = true;
 unsigned long lastScan = 0;
@@ -305,19 +217,70 @@ void loop() {
     return;
   }
 
+  // Scan for networks periodically
   if (millis() - lastScan > scanInterval) {
     lastScan = millis();
     displayLoading();
-    auto allNetworks = getWifiNetworks();
-    auto closed = getClosedWifiNetworks(allNetworks);
-    auto open = getOpenWifiNetworks(allNetworks);
-    auto vulnerable = getVulnerableWifiNetworks(closed);
-    auto web = getValidatedOpenWifiNetworks(open);
-    auto finalNetworks = mergeAndOrderWifiNetworks(closed, open, web, vulnerable);
 
-    displayTopBar(true);
-    displayList(finalNetworks);
-    displayWifiCount(finalNetworks);
+    if (testingConnection) {
+      WiFi.disconnect();
+      testingConnection = false;
+    }
+
+    networks = getWifiNetworks();
+    processWifiNetworks(networks);
+    webTestIndex = 0; // Reset test index for the new list
   }
+
+  // Asynchronously test open networks for web access
+  if (!testingConnection && webTestIndex < networks.size()) {
+    // Find the next open network to test
+    while (webTestIndex < networks.size() && !networks[webTestIndex].open) {
+      webTestIndex++;
+    }
+
+    if (webTestIndex < networks.size()) {
+      WiFi.begin(networks[webTestIndex].ssid.c_str());
+      webTestStartTime = millis();
+      testingConnection = true;
+    }
+  }
+
+  if (testingConnection) {
+    // If connection is successful, check for web access
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      http.begin("http://example.com");
+      int httpCode = http.GET();
+      http.end();
+      networks[webTestIndex].webAccess = httpCode > 0;
+
+      WiFi.disconnect();
+      testingConnection = false;
+      webTestIndex++;
+    }
+    // If connection timed out, mark as failed
+    else if (millis() - webTestStartTime > connectionTimeout) {
+      networks[webTestIndex].webAccess = false;
+
+      WiFi.disconnect();
+      testingConnection = false;
+      webTestIndex++;
+    }
+  }
+
+  // Sort networks for display based on category and signal strength
+  std::sort(networks.begin(), networks.end(), [](const WiFiNetwork& a, const WiFiNetwork& b) {
+    if (a.webAccess != b.webAccess) return a.webAccess;
+    if (a.open != b.open) return a.open;
+    if (a.vulnerable != b.vulnerable) return a.vulnerable;
+    return a.signalStrength > b.signalStrength; // Stronger signal is a larger number
+  });
+
+  // Update display continuously
+  displayTopBar(true);
+  displayList(networks);
+  displayWifiCount(networks);
+  delay(10); // Small delay to prevent busy-looping and improve stability
 }
 
